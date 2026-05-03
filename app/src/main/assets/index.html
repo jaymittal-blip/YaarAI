@@ -506,7 +506,6 @@ function goBack() {
 let currentAbort = null;
 
 function resetStreamingState() {
-  if (currentAbort) { try { currentAbort.abort(); } catch(e){} }
   currentAbort = null;
   isStreaming = false;
   document.getElementById('sendBtn').disabled = false;
@@ -533,8 +532,7 @@ async function callAI(userMessage) {
   }
 
   const messages = [{ role:'system', content: p.systemPrompt }, ...chatHistory.slice(-12)];
-  const abort = new AbortController();
-  const timeout = setTimeout(() => abort.abort(), 15000);
+  const timeoutMs = 15000;
 
   try {
     const url = provider === 'ollama'
@@ -547,8 +545,13 @@ async function callAI(userMessage) {
       ? { 'Content-Type': 'application/json' }
       : { 'Content-Type': 'application/json', 'Authorization': `Bearer ${groqApiKey}` };
 
-    const res = await fetch(url, { method:'POST', headers, body: JSON.stringify(body), signal: abort.signal });
-    clearTimeout(timeout);
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('⏱️ Request timed out — try again yaar!')), timeoutMs)
+    );
+    const res = await Promise.race([
+      fetch(url, { method:'POST', headers, body: JSON.stringify(body) }),
+      timeoutPromise
+    ]);
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -561,8 +564,6 @@ async function callAI(userMessage) {
     chatHistory.push({ role: 'assistant', content: reply });
     return reply;
   } catch (err) {
-    clearTimeout(timeout);
-    if (err.name === 'AbortError') throw new Error('⏱️ Request timed out — try again yaar!');
     throw err;
   }
 }
@@ -589,21 +590,20 @@ async function callAIStream(userMessage, onChunk, onDone) {
     return;
   }
 
-  // Groq streaming with AbortController + 15s hard timeout
-  const abort = new AbortController();
-  currentAbort = abort;
-  const timeout = setTimeout(() => { abort.abort(); }, 15000);
-
+  // Groq streaming with Promise.race timeout (AbortSignal breaks Android WebView)
+  currentAbort = {};  // placeholder, not a real AbortController
   const messages = [{ role:'system', content: p.systemPrompt }, ...chatHistory.slice(-12)];
 
   try {
-    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('⏱️ Request timed out — try again yaar!')), 15000)
+    );
+    const fetchPromise = fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${groqApiKey}` },
-      body: JSON.stringify({ model: modelName, messages, max_tokens: 200, temperature: 0.85, top_p: 0.9, stream: true }),
-      signal: abort.signal
+      body: JSON.stringify({ model: modelName, messages, max_tokens: 200, temperature: 0.85, top_p: 0.9, stream: true })
     });
-    clearTimeout(timeout);
+    const res = await Promise.race([fetchPromise, timeoutPromise]);
 
     if (!res.ok) {
       const errData = await res.json().catch(() => ({}));
@@ -618,12 +618,13 @@ async function callAIStream(userMessage, onChunk, onDone) {
     let lastChunkTime = Date.now();
 
     // Watchdog: if no chunk arrives in 8s, abort
+    let timedOut = false;
     const watchdog = setInterval(() => {
-      if (Date.now() - lastChunkTime > 8000) { clearInterval(watchdog); abort.abort(); }
+      if (Date.now() - lastChunkTime > 8000) { clearInterval(watchdog); timedOut = true; }
     }, 1000);
 
     try {
-      while (true) {
+      while (!timedOut) {
         const { done, value } = await reader.read();
         if (done) break;
         lastChunkTime = Date.now();
@@ -647,9 +648,7 @@ async function callAIStream(userMessage, onChunk, onDone) {
     onDone(fullText);
 
   } catch (err) {
-    clearTimeout(timeout);
-    chatHistory.pop(); // remove the user msg we pushed at top (will be re-added on retry)
-    if (err.name === 'AbortError') throw new Error('⏱️ Request timed out — try again yaar!');
+    chatHistory.pop();
     throw err;
   } finally {
     currentAbort = null;
